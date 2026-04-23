@@ -494,6 +494,19 @@ class DecodePreallocQueue:
             if rids_to_check is not None and req.rid not in rids_to_check:
                 continue
 
+            # HiSparse: host-pool slots were evicted under memory pressure while
+            # this request sat in the retracted queue.  KV is gone — abort cleanly
+            # instead of resuming with corrupt (empty) KV state.
+            if getattr(req, "hisparse_host_evicted", False):
+                prepare_abort(
+                    req,
+                    "HiSparse host-pool slots were reclaimed during retraction; request aborted",
+                )
+                self.scheduler.stream_output([req], req.return_logprob)
+                req.is_retracted = False
+                indices_to_remove.add(i)
+                continue
+
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
@@ -512,7 +525,14 @@ class DecodePreallocQueue:
             allocatable_tokens -= required_tokens_for_request
 
             # load from cpu, release the cpu copy
-            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+            if self.scheduler.enable_hisparse:
+                # Re-initialize the device buffer that was freed by pause_req().
+                # Host-pool KV is intact; admit_request_direct() allocates the
+                # small decode working-set buffer and marks it cold so the first
+                # swap-in loads top-k tokens from host.
+                self.scheduler.hisparse_coordinator.admit_request_direct(req)
+            else:
+                req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
         self.retracted_queue = [
             entry
@@ -910,13 +930,31 @@ class DecodePreallocQueue:
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
-            # Allocate host indices for the RDMA transfer target
-            host_indices = coordinator.mem_pool_host.alloc(fill_len)
-            if host_indices is None:
-                raise RuntimeError(
-                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
-                    f"in _pre_alloc (req {req.rid})"
-                )
+            # For retracted HiSparse requests, reuse the host indices preserved
+            # by pause_req() — do NOT allocate new host slots (KV is still there).
+            if hasattr(req, "hisparse_host_indices"):
+                host_indices = req.hisparse_host_indices.to(device=coordinator.device)
+                del req.hisparse_host_indices
+                # Remove from eviction registry — this req resumed successfully.
+                coordinator._paused_reqs_registry.pop(req.rid, None)
+                # kv_allocated_len grows as decode tokens are generated, so the
+                # saved host_indices may be longer than fill_len (which is
+                # recomputed from reset_for_retract's output_ids).  Truncate and
+                # free the excess slots so the assignment below doesn't crash.
+                if host_indices.numel() > fill_len:
+                    excess = host_indices[fill_len:]
+                    valid_excess = excess[excess >= 0]
+                    if valid_excess.numel() > 0:
+                        coordinator.mem_pool_host.free(valid_excess)
+                    host_indices = host_indices[:fill_len]
+            else:
+                # Fresh request: allocate new host indices for RDMA transfer target.
+                host_indices = coordinator.mem_pool_host.alloc(fill_len)
+                if host_indices is None:
+                    raise RuntimeError(
+                        f"HiSparse host mem pool alloc failed for {fill_len} tokens "
+                        f"in _pre_alloc (req {req.rid})"
+                    )
             host_indices = host_indices.to(device=coordinator.device)
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
         elif self.token_to_kv_pool_allocator.page_size == 1:

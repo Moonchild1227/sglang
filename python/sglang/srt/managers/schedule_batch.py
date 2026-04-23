@@ -2135,10 +2135,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
 
+        # HiSparse retraction: free GPU device buffers but preserve host-pool KV
+        # so that resume_retracted_reqs() can restore without a full re-prefill.
+        # pause_req() must run before release_kv_cache() because release_kv_cache
+        # -> req_to_token_pool.free(req) sets req.req_pool_idx = None.
         if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.retract_req(req)
+            host_indices = self.hisparse_coordinator.pause_req(req)
+            if host_indices is not None:
+                req.hisparse_host_indices = host_indices
+            else:
+                # Staging req was aborted by pause_req() — KV is incomplete.
+                # Mark for clean abort on resume instead of resuming with empty KV.
+                req.hisparse_host_evicted = True
 
-        if server_args.disaggregation_mode == "decode":
+        if server_args.disaggregation_mode == "decode" and not server_args.enable_hisparse:
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )

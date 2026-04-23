@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple
+from typing import Dict, List, NamedTuple, Optional
 
 import torch
 
@@ -90,6 +90,11 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+
+        # Registry of requests that were paused (retracted) but whose host-pool
+        # KV is still alive.  Used to reclaim those slots when the host pool is
+        # under pressure during decode-step backups.  Keyed by req.rid.
+        self._paused_reqs_registry: Dict[str, Req] = {}
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -445,6 +450,10 @@ class HiSparseCoordinator:
 
         host_locs = self.mem_pool_host.alloc(len(device_locs))
         if host_locs is None:
+            # Try to free host-pool slots held by paused/retracted requests.
+            self._try_evict_paused_host_slots(len(device_locs))
+            host_locs = self.mem_pool_host.alloc(len(device_locs))
+        if host_locs is None:
             logger.error(
                 "HiSparse: host mem pool alloc failed for %d decode backup tokens",
                 len(device_locs),
@@ -613,6 +622,120 @@ class HiSparseCoordinator:
         else:
             self.request_finished(req)
 
+    def pause_req(self, req: Req) -> Optional[torch.Tensor]:
+        """Free GPU resources while preserving host-pool KV for retraction resume.
+
+        Unlike request_finished(), this does NOT free the host pool so that
+        resume_retracted_reqs() can restore the request without a full
+        re-prefill + KV transfer.
+
+        Returns the saved host-pool indices (to be stored on req as
+        hisparse_host_indices), or None when the request is still in the
+        staging phase (KV not yet fully received) — in that case the caller
+        falls back to a full abort.
+        """
+        if req.hisparse_staging:
+            # KV may be only partially written; safest to do full abort.
+            self.abort_staging_request(req)
+            return None
+
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        if self._has_pending_backup:
+            self._backup_done_event.wait(device_module.current_stream())
+            self._has_pending_backup = False
+
+        req_idx = req.req_pool_idx
+
+        # Flush any un-backed-up decode token to host BEFORE freeing device
+        # buffer.  _eager_backup_previous_token() is 1 step behind, so the
+        # most-recent decode token may still only exist in the device buffer.
+        # If we free the buffer first, that KV data is lost; on resume the
+        # swap-in kernel reads host_cache_locs = -1 → illegal memory access.
+        last_pos = req.kv_allocated_len - 1
+        if last_pos >= 0 and self.req_to_host_pool[req_idx, last_pos].item() == -1:
+            buffer_slot = min(last_pos, self.device_buffer_size)
+            device_loc = self.req_to_device_buffer[req_idx, buffer_slot].unsqueeze(0)
+            host_loc = self.mem_pool_host.alloc(1)
+            if host_loc is not None:
+                host_loc = host_loc.to(device=self.device)
+                self.req_to_host_pool[req_idx, last_pos] = host_loc
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device, host_loc, device_loc, io_backend="kernel",
+                )
+
+        # Free GPU device-buffer slots (reclaim HBM for other requests).
+        current_cap = int(self.req_device_buffer_size[req_idx])
+        buffer_indices = self.req_to_device_buffer[req_idx, :current_cap]
+        self.token_to_kv_pool_allocator.free_hisparse_indices(buffer_indices)
+
+        # Clear the full→hisparse mapping for ALL logical indices of this request.
+        # This prevents release_kv_cache() → free() → free_hisparse() from reading
+        # stale mapping entries and double-freeing the same hisparse device indices
+        # that we just freed above.
+        allocated_locs = self.req_to_token_pool.req_to_token[
+            req_idx, : req.kv_allocated_len
+        ]
+        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+            allocated_locs
+        ] = 0
+
+        # Save host-pool indices BEFORE clearing the mapping row (do NOT free them).
+        host_indices = self.req_to_host_pool[req_idx, : req.kv_allocated_len].clone()
+
+        # Reset per-slot GPU state; host pool is intentionally kept alive.
+        self.req_device_buffer_tokens[:, req_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req_idx, :] = -1
+        self.req_to_device_buffer[req_idx, :] = 0
+        self.req_device_buffer_size[req_idx] = 0
+        self.req_to_host_pool[req_idx, :] = -1
+        self.lru_slots[:, req_idx, :].copy_(self._lru_init)
+        self._skip_first_backup[req_idx] = False
+
+        # Register so _try_evict_paused_host_slots() can reclaim if pool pressure
+        # arises before this request is resumed.
+        self._paused_reqs_registry[req.rid] = req
+
+        return host_indices
+
+    def _try_evict_paused_host_slots(self, needed: int) -> int:
+        """Reclaim host-pool slots from paused (retracted) requests.
+
+        Called when ``mem_pool_host.alloc()`` fails during a decode backup step.
+        Iterates through the paused-req registry, frees their host-pool indices,
+        and marks them with ``hisparse_host_evicted = True`` so that
+        ``resume_retracted_reqs()`` can abort them instead of trying to resume
+        with missing KV.
+
+        Returns the total number of slots freed.
+        """
+        freed = 0
+        evict_rids = []
+        for rid, req in list(self._paused_reqs_registry.items()):
+            if not hasattr(req, "hisparse_host_indices"):
+                evict_rids.append(rid)
+                continue
+            indices = req.hisparse_host_indices.to(device=self.device)
+            valid = indices[indices >= 0]
+            if valid.numel() > 0:
+                self.mem_pool_host.free(valid)
+                freed += valid.numel()
+            del req.hisparse_host_indices
+            req.hisparse_host_evicted = True
+            evict_rids.append(rid)
+            if freed >= needed:
+                break
+        for rid in evict_rids:
+            self._paused_reqs_registry.pop(rid, None)
+        if evict_rids:
+            logger.warning(
+                "HiSparse: evicted host-pool slots from %d paused req(s) (%d slots freed) to satisfy backup alloc of %d tokens",
+                len(evict_rids),
+                freed,
+                needed,
+            )
+        return freed
+
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
@@ -620,6 +743,9 @@ class HiSparseCoordinator:
         if self._has_pending_backup:
             self._backup_done_event.wait(device_module.current_stream())
             self._has_pending_backup = False
+
+        # Clean up paused-req registry (no-op for normal completions).
+        self._paused_reqs_registry.pop(req.rid, None)
 
         # release memory — only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
